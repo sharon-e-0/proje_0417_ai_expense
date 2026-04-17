@@ -91,7 +91,7 @@
             <!-- Manual Form -->
             <div class="glass-card p-6 rounded-2xl h-full">
                 <h2 class="text-xl font-bold mb-4 flex items-center gap-2">✍️ 수동 지출 입력</h2>
-                <form id="manualForm" class="space-y-4">
+                <form id="manualForm" class="space-y-4" novalidate>
                     <div class="grid grid-cols-2 gap-4">
                         <div><label class="block text-sm font-medium text-gray-700 mb-1">상호명</label><input type="text" id="manStore" required class="w-full px-3 py-2 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-indigo-500 bg-white/70"></div>
                         <div><label class="block text-sm font-medium text-gray-700 mb-1">날짜</label><input type="date" id="manDate" required class="w-full px-3 py-2 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-indigo-500 bg-white/70"></div>
@@ -242,7 +242,14 @@
         function processWarpTransform(imageElement) {
             if (!isCvReady) throw new Error('컴퓨터 비전 라이브러리(OpenCV)가 아직 로딩 중입니다. 잠시 후 시도해주세요.');
 
-            let src = cv.imread(imageElement);
+            let src;
+            try {
+                src = cv.imread(imageElement);
+            } catch (e) {
+                console.error("OpenCV imread Error:", e);
+                return getOriginalBase64(imageElement);
+            }
+            
             // 크기 제한 (빠른 연산 및 윤곽선 검출 안정화)
             let maxDim = 800;
             let scale = 1.0;
@@ -256,90 +263,102 @@
             }
 
             let gray = new cv.Mat();
-            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-            
             let blur = new cv.Mat();
-            cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
-            
             let edges = new cv.Mat();
-            cv.Canny(blur, edges, 75, 200, 3, false);
-            
             let contours = new cv.MatVector();
             let hierarchy = new cv.Mat();
-            cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
-            
-            let maxArea = 0;
-            let maxContour = null;
             let maxContourApprox = new cv.Mat();
-            
-            for (let i = 0; i < contours.size(); ++i) {
-                let cnt = contours.get(i);
-                let area = cv.contourArea(cnt);
-                if (area > maxArea) {
-                    let peri = cv.arcLength(cnt, true);
-                    let approx = new cv.Mat();
-                    cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
-                    if (approx.rows === 4 && area > (src.cols * src.rows * 0.03)) { // 너무 작은 조각 제외
-                        maxArea = area;
-                        if (maxContour) maxContour.delete();
-                        maxContour = cnt.clone();
-                        approx.copyTo(maxContourApprox);
-                    }
-                    approx.delete();
-                }
-            }
-            
+            let maxContour = null;
             let warpedBase64 = null;
-            if (maxArea > 0 && maxContourApprox.rows === 4) {
-                console.log("영수증 가장자리 4개의 꼭지점을 찾았습니다! 와핑 변환을 적용합니다.");
+            
+            try {
+                cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+                cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+                cv.Canny(blur, edges, 75, 200, 3, false);
                 
-                let pts = [];
-                for(let i=0; i<4; i++) {
-                    pts.push({ x: maxContourApprox.data32S[i*2], y: maxContourApprox.data32S[i*2+1] });
+                cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+                
+                let maxArea = 0;
+                
+                for (let i = 0; i < contours.size(); ++i) {
+                    let cnt = contours.get(i);
+                    let area = cv.contourArea(cnt);
+                    if (area > maxArea) {
+                        let peri = cv.arcLength(cnt, true);
+                        let approx = new cv.Mat();
+                        cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+                        if (approx.rows === 4 && area > (src.cols * src.rows * 0.03)) { // 너무 작은 조각 제외
+                            maxArea = area;
+                            if (maxContour) maxContour.delete();
+                            maxContour = cnt.clone();
+                            approx.copyTo(maxContourApprox);
+                        }
+                        approx.delete();
+                    }
                 }
                 
-                // y축 기준 정렬 (상, 하 파티션)
-                pts.sort((a,b) => a.y - b.y);
-                let top = [pts[0], pts[1]].sort((a,b) => a.x - b.x);
-                let bottom = [pts[2], pts[3]].sort((a,b) => a.x - b.x);
-                let orderedPts = [top[0], top[1], bottom[0], bottom[1]]; // TL, TR, BL, BR
-                
-                let tl = orderedPts[0], tr = orderedPts[1], bl = orderedPts[2], br = orderedPts[3];
-                
-                let widthA = Math.sqrt(Math.pow(br.x - bl.x, 2) + Math.pow(br.y - bl.y, 2));
-                let widthB = Math.sqrt(Math.pow(tr.x - tl.x, 2) + Math.pow(tr.y - tl.y, 2));
-                let maxWidth = Math.max(Math.round(widthA), Math.round(widthB));
-                
-                let heightA = Math.sqrt(Math.pow(tr.x - br.x, 2) + Math.pow(tr.y - br.y, 2));
-                let heightB = Math.sqrt(Math.pow(tl.x - bl.x, 2) + Math.pow(tl.y - bl.y, 2));
-                let maxHeight = Math.max(Math.round(heightA), Math.round(heightB));
-                
-                let srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, bl.x, bl.y, br.x, br.y]);
-                let dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, maxWidth - 1, 0, 0, maxHeight - 1, maxWidth - 1, maxHeight - 1]);
-                
-                let transformM = cv.getPerspectiveTransform(srcTri, dstTri);
-                let warped = new cv.Mat();
-                let dsizeWarp = new cv.Size(maxWidth, maxHeight);
-                
-                cv.warpPerspective(src, warped, transformM, dsizeWarp, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
-                
-                let hiddenCanvas = document.createElement('canvas');
-                cv.imshow(hiddenCanvas, warped);
-                warpedBase64 = hiddenCanvas.toDataURL('image/jpeg', 0.8);
-                
-                transformM.delete(); warped.delete(); srcTri.delete(); dstTri.delete();
-            } else {
-                console.log("영수증 가장자리를 선명하게 찾지 못해 원본 이미지 스케일로 진행합니다.");
-                let hiddenCanvas = document.createElement('canvas');
-                cv.imshow(hiddenCanvas, src);
-                warpedBase64 = hiddenCanvas.toDataURL('image/jpeg', 0.8);
+                if (maxArea > 0 && maxContourApprox.rows === 4) {
+                    console.log("영수증 가장자리 4개의 꼭지점을 찾았습니다! 와핑 변환을 적용합니다.");
+                    let pts = [];
+                    for(let i=0; i<4; i++) {
+                        pts.push({ x: maxContourApprox.data32S[i*2], y: maxContourApprox.data32S[i*2+1] });
+                    }
+                    pts.sort((a,b) => a.y - b.y);
+                    let top = [pts[0], pts[1]].sort((a,b) => a.x - b.x);
+                    let bottom = [pts[2], pts[3]].sort((a,b) => a.x - b.x);
+                    let orderedPts = [top[0], top[1], bottom[0], bottom[1]];
+                    
+                    let tl = orderedPts[0], tr = orderedPts[1], bl = orderedPts[2], br = orderedPts[3];
+                    let widthA = Math.sqrt(Math.pow(br.x - bl.x, 2) + Math.pow(br.y - bl.y, 2));
+                    let widthB = Math.sqrt(Math.pow(tr.x - tl.x, 2) + Math.pow(tr.y - tl.y, 2));
+                    let maxWidth = Math.max(Math.round(widthA), Math.round(widthB));
+                    let heightA = Math.sqrt(Math.pow(tr.x - br.x, 2) + Math.pow(tr.y - br.y, 2));
+                    let heightB = Math.sqrt(Math.pow(tl.x - bl.x, 2) + Math.pow(tl.y - bl.y, 2));
+                    let maxHeight = Math.max(Math.round(heightA), Math.round(heightB));
+                    
+                    let srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, bl.x, bl.y, br.x, br.y]);
+                    let dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, maxWidth - 1, 0, 0, maxHeight - 1, maxWidth - 1, maxHeight - 1]);
+                    
+                    let transformM = cv.getPerspectiveTransform(srcTri, dstTri);
+                    let warped = new cv.Mat();
+                    let dsizeWarp = new cv.Size(maxWidth, maxHeight);
+                    
+                    cv.warpPerspective(src, warped, transformM, dsizeWarp, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
+                    
+                    let hiddenCanvas = document.createElement('canvas');
+                    cv.imshow(hiddenCanvas, warped);
+                    warpedBase64 = hiddenCanvas.toDataURL('image/jpeg', 0.8);
+                    
+                    transformM.delete(); warped.delete(); srcTri.delete(); dstTri.delete();
+                } else {
+                    console.log("영수증 가장자리를 찾지 못해 원본 이미지를 반환합니다.");
+                    warpedBase64 = getOriginalBase64(imageElement);
+                }
+            } catch (err) {
+                console.error("OpenCV processing failed:", err);
+                warpedBase64 = getOriginalBase64(imageElement);
+            } finally {
+                // Cleanup
+                try { src.delete(); } catch(e){}
+                try { gray.delete(); } catch(e){}
+                try { blur.delete(); } catch(e){}
+                try { edges.delete(); } catch(e){}
+                try { contours.delete(); } catch(e){}
+                try { hierarchy.delete(); } catch(e){}
+                try { maxContourApprox.delete(); } catch(e){}
+                try { if(maxContour) maxContour.delete(); } catch(e){}
             }
-            
-            src.delete(); gray.delete(); blur.delete(); edges.delete();
-            contours.delete(); hierarchy.delete(); maxContourApprox.delete();
-            if(maxContour) maxContour.delete();
             
             return warpedBase64;
+        }
+
+        function getOriginalBase64(imgElement) {
+            let canvas = document.createElement('canvas');
+            canvas.width = imgElement.naturalWidth;
+            canvas.height = imgElement.naturalHeight;
+            let ctx = canvas.getContext('2d');
+            ctx.drawImage(imgElement, 0, 0);
+            return canvas.toDataURL('image/jpeg', 0.8);
         }
 
         async function analyzeReceipt(file) {
@@ -369,11 +388,18 @@
                     preview.classList.remove('hidden');
                     pText.textContent = "AI 통신 분석 중...";
                     
-                    const prompt = "영수증 이미지에서 지출 총액 (amount), 날짜 (date 형식: YYYY-MM-DD), 가게이름 (store), 그리고 지출항목을 식비, 교통, 쇼핑, 기타 중 하나로 분류(category)해서 JSON 형식으로 추출해줘.\\n\\n" + processedBase64;
+                    const promptText = "영수증 이미지에서 지출 총액 (amount), 날짜 (date 형식: YYYY-MM-DD), 가게이름 (store), 그리고 지출항목을 식비, 교통, 쇼핑, 기타 중 하나로 분류(category)해서 오직 JSON 형식으로만 추출해줘.";
                     const res = await fetch('https://api.openai.com/v1/responses', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-                        body: JSON.stringify({ model: "gpt-5-nano-2025-08-07", input: prompt, max_output_tokens: 8000 })
+                        body: JSON.stringify({ 
+                            model: "gpt-5-nano-2025-08-07", 
+                            input: [
+                                { type: "text", text: promptText },
+                                { type: "image_url", image_url: { url: processedBase64 } }
+                            ], 
+                            max_output_tokens: 8000 
+                        })
                     });
                     
                     if (!res.ok) throw new Error('API Error');
