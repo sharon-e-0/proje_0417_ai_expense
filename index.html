@@ -11,6 +11,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady()" type="text/javascript"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@300;400;500;600;700&display=swap');
         body { font-family: 'Pretendard', sans-serif; }
@@ -78,6 +79,9 @@
                         <span class="text-lg font-bold text-indigo-900">클릭 또는 이미지 드래그</span>
                     </div>
                 </div>
+                <!-- OpenCV 전처리 프리뷰 -->
+                <img id="croppedPreview" class="hidden mt-4 mx-auto border-2 border-indigo-200 rounded-lg shadow-sm max-h-48 object-contain">
+                
                 <div id="loadingIndicator" class="hidden flex-col items-center justify-center py-4 mt-2">
                     <div class="w-8 h-8 border-t-2 border-indigo-600 rounded-full animate-spin mb-2"></div>
                     <p class="text-sm font-bold text-indigo-600 animate-pulse">분석 중...</p>
@@ -153,7 +157,7 @@
 
         document.addEventListener('DOMContentLoaded', () => {
             const today = new Date();
-            document.getElementById('monthFilter').value = \`\${today.getFullYear()}-\${String(today.getMonth()+1).padStart(2,'0')}\`;
+            document.getElementById('monthFilter').value = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}`;
             document.getElementById('manDate').value = today.toISOString().split('T')[0];
 
             fetchExpenses();
@@ -220,6 +224,124 @@
             });
         });
 
+        let isCvReady = false;
+        function onOpenCvReady() {
+            isCvReady = true;
+            console.log('OpenCV.js is ready.');
+        }
+
+        function imgToCv(dataURL) {
+            return new Promise((resolve, reject) => {
+                let img = new Image();
+                img.onload = () => resolve(img);
+                img.onerror = () => reject(new Error('이미지 로드 실패'));
+                img.src = dataURL;
+            });
+        }
+
+        function processWarpTransform(imageElement) {
+            if (!isCvReady) throw new Error('컴퓨터 비전 라이브러리(OpenCV)가 아직 로딩 중입니다. 잠시 후 시도해주세요.');
+
+            let src = cv.imread(imageElement);
+            // 크기 제한 (빠른 연산 및 윤곽선 검출 안정화)
+            let maxDim = 800;
+            let scale = 1.0;
+            if (src.cols > maxDim || src.rows > maxDim) {
+                scale = maxDim / Math.max(src.cols, src.rows);
+                let dsize = new cv.Size(Math.round(src.cols * scale), Math.round(src.rows * scale));
+                let resized = new cv.Mat();
+                cv.resize(src, resized, dsize, 0, 0, cv.INTER_AREA);
+                src.delete();
+                src = resized;
+            }
+
+            let gray = new cv.Mat();
+            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+            
+            let blur = new cv.Mat();
+            cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+            
+            let edges = new cv.Mat();
+            cv.Canny(blur, edges, 75, 200, 3, false);
+            
+            let contours = new cv.MatVector();
+            let hierarchy = new cv.Mat();
+            cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+            
+            let maxArea = 0;
+            let maxContour = null;
+            let maxContourApprox = new cv.Mat();
+            
+            for (let i = 0; i < contours.size(); ++i) {
+                let cnt = contours.get(i);
+                let area = cv.contourArea(cnt);
+                if (area > maxArea) {
+                    let peri = cv.arcLength(cnt, true);
+                    let approx = new cv.Mat();
+                    cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+                    if (approx.rows === 4 && area > (src.cols * src.rows * 0.03)) { // 너무 작은 조각 제외
+                        maxArea = area;
+                        if (maxContour) maxContour.delete();
+                        maxContour = cnt.clone();
+                        approx.copyTo(maxContourApprox);
+                    }
+                    approx.delete();
+                }
+            }
+            
+            let warpedBase64 = null;
+            if (maxArea > 0 && maxContourApprox.rows === 4) {
+                console.log("영수증 가장자리 4개의 꼭지점을 찾았습니다! 와핑 변환을 적용합니다.");
+                
+                let pts = [];
+                for(let i=0; i<4; i++) {
+                    pts.push({ x: maxContourApprox.data32S[i*2], y: maxContourApprox.data32S[i*2+1] });
+                }
+                
+                // y축 기준 정렬 (상, 하 파티션)
+                pts.sort((a,b) => a.y - b.y);
+                let top = [pts[0], pts[1]].sort((a,b) => a.x - b.x);
+                let bottom = [pts[2], pts[3]].sort((a,b) => a.x - b.x);
+                let orderedPts = [top[0], top[1], bottom[0], bottom[1]]; // TL, TR, BL, BR
+                
+                let tl = orderedPts[0], tr = orderedPts[1], bl = orderedPts[2], br = orderedPts[3];
+                
+                let widthA = Math.sqrt(Math.pow(br.x - bl.x, 2) + Math.pow(br.y - bl.y, 2));
+                let widthB = Math.sqrt(Math.pow(tr.x - tl.x, 2) + Math.pow(tr.y - tl.y, 2));
+                let maxWidth = Math.max(Math.round(widthA), Math.round(widthB));
+                
+                let heightA = Math.sqrt(Math.pow(tr.x - br.x, 2) + Math.pow(tr.y - br.y, 2));
+                let heightB = Math.sqrt(Math.pow(tl.x - bl.x, 2) + Math.pow(tl.y - bl.y, 2));
+                let maxHeight = Math.max(Math.round(heightA), Math.round(heightB));
+                
+                let srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, bl.x, bl.y, br.x, br.y]);
+                let dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, maxWidth - 1, 0, 0, maxHeight - 1, maxWidth - 1, maxHeight - 1]);
+                
+                let transformM = cv.getPerspectiveTransform(srcTri, dstTri);
+                let warped = new cv.Mat();
+                let dsizeWarp = new cv.Size(maxWidth, maxHeight);
+                
+                cv.warpPerspective(src, warped, transformM, dsizeWarp, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
+                
+                let hiddenCanvas = document.createElement('canvas');
+                cv.imshow(hiddenCanvas, warped);
+                warpedBase64 = hiddenCanvas.toDataURL('image/jpeg', 0.8);
+                
+                transformM.delete(); warped.delete(); srcTri.delete(); dstTri.delete();
+            } else {
+                console.log("영수증 가장자리를 선명하게 찾지 못해 원본 이미지 스케일로 진행합니다.");
+                let hiddenCanvas = document.createElement('canvas');
+                cv.imshow(hiddenCanvas, src);
+                warpedBase64 = hiddenCanvas.toDataURL('image/jpeg', 0.8);
+            }
+            
+            src.delete(); gray.delete(); blur.delete(); edges.delete();
+            contours.delete(); hierarchy.delete(); maxContourApprox.delete();
+            if(maxContour) maxContour.delete();
+            
+            return warpedBase64;
+        }
+
         async function analyzeReceipt(file) {
             const apiKey = localStorage.getItem('openai_api_key_receipt');
             if (!apiKey) return alert('API 키를 저장해주세요.');
@@ -227,22 +349,37 @@
             const reader = new FileReader();
             reader.readAsDataURL(file);
             reader.onload = async (e) => {
-                const base64Image = e.target.result;
+                const base64Orig = e.target.result;
                 const ind = document.getElementById('loadingIndicator');
+                const pText = ind.querySelector('p');
+                const preview = document.getElementById('croppedPreview');
+                
                 ind.style.display = 'flex';
+                preview.classList.add('hidden');
                 
                 try {
-                    const prompt = "영수증 이미지에서 지출 총액 (amount), 날짜 (date 형식: YYYY-MM-DD), 가게이름 (store), 그리고 지출항목을 식비, 교통, 쇼핑, 기타 중 하나로 분류(category)해서 JSON 형식으로 추출해줘.\\n\\n" + base64Image;
+                    pText.textContent = "가장자리 크롭 전처리 중...";
+                    const imgObj = await imgToCv(base64Orig);
+                    // 약간의 렌더링 딜레이를 주어 UI 차단 방지
+                    await new Promise(r => setTimeout(r, 100)); 
+                    
+                    const processedBase64 = processWarpTransform(imgObj);
+                    
+                    preview.src = processedBase64;
+                    preview.classList.remove('hidden');
+                    pText.textContent = "AI 통신 분석 중...";
+                    
+                    const prompt = "영수증 이미지에서 지출 총액 (amount), 날짜 (date 형식: YYYY-MM-DD), 가게이름 (store), 그리고 지출항목을 식비, 교통, 쇼핑, 기타 중 하나로 분류(category)해서 JSON 형식으로 추출해줘.\\n\\n" + processedBase64;
                     const res = await fetch('https://api.openai.com/v1/responses', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'Authorization': \`Bearer \${apiKey}\` },
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
                         body: JSON.stringify({ model: "gpt-5-nano-2025-08-07", input: prompt, max_output_tokens: 8000 })
                     });
                     
                     if (!res.ok) throw new Error('API Error');
                     const result = await res.json();
                     const messageContent = (result.data?.output || []).find(item => item.type === 'message')?.content?.[0]?.text;
-                    const parsedData = JSON.parse(messageContent.replace(/\`\`\`json/g, '').replace(/\`\`\`/g, '').trim());
+                    const parsedData = JSON.parse(messageContent.replace(/```json/g, '').replace(/```/g, '').trim());
 
                     const { error } = await supabase.from('expenses').insert([{
                         amount: parseInt(String(parsedData.amount).replace(/[^0-9]/g, '')) || 0,
